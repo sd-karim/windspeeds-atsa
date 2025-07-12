@@ -1,2 +1,9 @@
-# windspeeds-atsa
-Final RMD and rendered HTML for my semester project for an Applied Time Series Analysis class. 
+# Applied Time Series Analysis Project: Windspeeds
+
+This reposity is to store my semester project for the ATSA class I took Spring 2025. The assignment was to find any sort of time-based data, with several periods of consistent recordings, and use methods learned over the course of the semster to fit an accurate model and plot a forecast. I wanted to work with hurricane-adjacent data to get familiar with that as I was planning on having hurricane forecasting as a part of my senior thesis. I went to NOAA's website, where you can request different types of weather data from a chosen station. I was hoping to focus on barometric pressure as that's a strong indicator of when a hurricane is forming, but none of the stations I tried in the state had measurements for that, so I focused on windspeed instead. 
+
+My process for choosing model peramaters, fitting the model and forecasting are all in my final submission RMD, which I will attach to this document. The only changes I've made to this RMD since my submission for the class were small tweaks in the wording of the process and analysis, to make it easier to understand for anyone that would not have seen a draft and had discussed the details of the project with me like my professor did. Some dates had missing recordings for windspeed, so I found recordings from a seperate weather site and added them in by hand. The only date that there were no recordings for was October 10th 2024, when Hurricane Milton made landfall nearby. Since there is one day with an NA for windspeed, some of the plotting/fitting has an error message that NAs were produced, which happens when R tries to create a moving average with an NA value. 
+
+This project was done using RStudio, specifically the fpp3 and tidyverse packages. 
+
+Rendered HTML file [here](http://rpubs.com/sd-karim/1329220)
