@@ -1,0 +1,338 @@
+---
+title: "ATSA Project - Windspeeds"
+author: "Sayda Karim"
+date: "Semester Project Spring 2025"
+output: 
+  html_document: 
+    df_print: kable
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(fpp3)
+library(tidyverse)
+```
+
+## Introduction and Setup
+
+For this project I wanted to forecast wind speed over time as a setup for possible further work. Since the ultimate goal here is to examine seasonal weather patterns for hurricanes and how those may be changing over time, the research question for this project is are there variables such as wind speed, barometric pressure, or temperature that could be used to forecast a "hurricane season" (ie, is there a predictable seasonal pattern for these variables that lines up with when we historically have been hit by hurricanes, are we seeing that the seasons are shifting over time or that the values of these variables are becoming more extreme during certain seasons?).
+
+NOAA says that some of the conditions in which hurricanes form are "a pre-existing weather disturbance [..,] warm water [..,] thunderstorm activity [.., and] low wind shear". That article also mentions that the beginning stages of a hurricane or tropical storm causes warm air to rise, which in turn creates an area of low pressure. From this description, the variables that might be good predictors are barometric pressure, temperature, and wind speed. Wind speed specifically is how tropical storms and hurricanes are categorized, but this may also help us see if there are times of the year where windspeeds are lower, which would mean less opposing winds towards the storm (aka low wind shear).
+
+To look at this I downloaded daily weather station recordings for SRQ from NOAA. For this station, there was no measurements taken for barometric pressure, and the average daily temperature was missing in large gaps from the recordings. I checked three other stations to see if barometric pressure was recorded anywhere else in the state (Tampa, Orlando and West Palm Beach airports). Not only was barometric pressure not recorded, but all four airport weather stations had the same several year gaps of missing data for the same variables, which likely means that the data that's missing has more to do with how NOAA saves/archives their data and less to do with an individual station's equipment being faulty. Since I had already begun working with the Sarasota data, it's the area I wanted to focus on and the other areas didn't have more complete data, I'm just going to continue with the SRQ station. 
+
+```{r}
+srqstation <- read.csv("project_data/srqNOAA.xlsb.csv", na.strings="NA, 9999")
+
+# keeping variables of interest so that dataframe is smaller:
+srqstation <- srqstation |> 
+  mutate(THUNDER = WT03) |> # rename weather type category to be more intuitive
+  mutate(TDIF = TMAX-TMIN) |>
+  select(STATION, DATE, AWND, TMAX, TMIN, TDIF, THUNDER, PRCP)
+
+
+# convert to tsibble
+srqstation <- srqstation |> 
+  mutate(DATE = mdy(DATE)) |>
+  as_tsibble(index = DATE)
+
+head(srqstation)
+```
+
+I went through and only kept the variables we might be interested in looking at: AWND (average wind speed in mph), TMAX (max temperature), TMIN (minimum temperature), TDIF (range between daily max and min), THUNDER (binary, is there thunder recorded in the area that day). Each variable is supposed to have one recording per day. This covers the aforementioned possible explanatory variables, and adds in THUNDER, where we can maybe see if thunderstorms in the area tend to lead to hurricanes. 
+
+*Note: went through and filled in NA values for AWND, TMAX, TMIN, and PRCP. Only date that I couldn't get any of the recordings on was 10-10-2024, where early in the morning, Hurricane Milton made landfall near Siesta Key as a category 3. This means MINIMUM wind speeds of 111mph.*
+
+
+## Exploration
+
+### Response/Forecasting Variable 
+
+Of the variables we have access to, I think average daily wind speed is the best response variable, so we're going to be focusing on trying to forecast that. 
+
+```{r}
+srqstation |> autoplot(AWND)
+```
+
+The plotting here is super dense (which makes sense for >9000 observations), so it's a little hard to differentiate seasonality and white noise. There doesn't appear to be an overall trend, but it's a little hard to tell like this. I thought spreading them out would make it easier to see, and from these we can sort of see a peak around maybe March of each year and a trough around September-ish, with lots of random noise and huge outliers. The big spikes in wind speed are good because that shows us that there's a pretty clear indicator for when a storm is hitting the state (previously mentioned examples were Ian and Jeanne, which are visible in the SRQ weather station despite the storms being in different parts of the state when those measurements are taken). 
+
+```{r, fig.show='hold'}
+srqstation |> 
+  filter(year(DATE) < 2009)|>
+  autoplot(AWND) +
+  ggtitle("2000-2008") +
+  ylim(0, 34)
+
+srqstation |> 
+  filter(year(DATE) >= 2009 & year(DATE) < 2017)|>
+  autoplot(AWND) +
+  ggtitle("2009-2016") +
+  ylim(0, 34)
+
+srqstation |> 
+  filter(year(DATE) >= 2017)|>
+  autoplot(AWND) +
+  ggtitle("2017-2025") +
+  ylim(0, 34)
+```
+
+run ggseason to get a clearer view of the yearly seasonality:
+
+```{r}
+srqstation |> gg_season(AWND) +
+  theme_bw() 
+```
+
+From the seasonal plot, if we just look at the bulk of the data and momentarily ignore the spikes, we can kind of see that wind speeds are more varied and slightly higher in Jan-Apr, less varied and lower in Jul-Oct, and back to being more varied and higher Oct-Dec. As an overall pattern this is interesting because what we consider "hurricane season" is usually late Summer-early Fall, which is when our windspeeds are the lowest here. We do, however, see more of these huge spikes/outliers in wind speed in the July-October range, which *does* match that idea about hurricane season. This may have to do with the low wind shear that was mentioned earlier, but it may also just be because that's a warmer time of year, which also contributes to tropical storm formation. 
+
+
+```{r}
+# make monthly averages for ggsubseries
+srqstation |>
+  index_by(yearmonth(DATE)) |>
+  summarise(AWND = mean(AWND)) |>
+  gg_subseries(y = AWND)
+```
+
+There still doesn't really seem to be much of a trend, but the specifics of that seasonal pattern is much more clear here-- average wind speeds peak around March/April each year, go down quite a bit in July/August, and go back up slightly in October/November. 
+
+From the exploratory plots I don't think we need any transformations because the variance isn't really changing consistently over time. Data isn't stationary, will need seasonal differencing because we've established that there is a seasonal pattern, but shouldn't need regular differencing because there doesn't seem to be a trend. 
+
+
+## Modeling
+
+We are observing a seasonal pattern in the data, so I think it's possible that we need seasonal differencing, but just to be sure we can check using KPSS tests: 
+
+```{r}
+srqstation |>
+  features(AWND, unitroot_nsdiffs)
+
+# no seasonal differencing needed? maybe regular differencing?
+
+srqstation |>
+  features(AWND, unitroot_ndiffs)
+```
+
+The unitroot functions suggest one **nonseasonal** difference to make the data stationary, which isn't what I had expected from looking at the exlporatory plots. For our ARIMA model, this gives us d = 1. 
+
+```{r}
+srqstation |>
+  gg_tsdisplay(difference(AWND), plot_type = "partial")
+```
+
+From the ACF, we're seeing spikes at lags 1-3, so this suggests a nonseasonal MA(3) model. The PACF has a pretty big spike at lag 2 and then slowly decays, which suggests an AR(2). We already know the data needs first differencing, so let's start by comparing pdq(0,1,3), (2,1,0), and similar:
+
+```{r}
+arima_tests <- srqstation |>
+  model("0,1,3" = ARIMA(AWND ~ pdq(0, 1, 3)), 
+        "2,1,0" = ARIMA(AWND ~ pdq(2, 1, 0)),
+        "1,1,3" = ARIMA(AWND ~ pdq(1, 1, 3)), 
+        "2,1,1" = ARIMA(AWND ~ pdq(2, 1, 1)),
+        "2, 1, 3" = ARIMA(AWND ~ pdq(2,1,3), order_constraint = TRUE),
+        "auto" = ARIMA(AWND, stepwise = FALSE)
+  )
+  glance(arima_tests) |>
+  arrange(AICc) |>
+  select(.model, AICc)
+  
+arima_tests
+```
+
+
+ARIMA(1,1,3) has the smallest AICc, even when compared with models with seasonal components. The second lowest AICc was the auto-selected model, an ARIMA (2,1,3)(1,0,0)[7]. All of the models that were auto-fitted to also have a seasonal component have a weekly seasonal period, which is interesting because it's not a pattern we'd expect to see with this data. I'm not entirely sure if R is picking the seven day period because it just expects all daily data to have a weekly period, or if there's a pattern in the data that the model picking algorithm is picking up on. I do know that when I was testing out basic forecasting methods, that the seasonal naive model also picks up on a weekly seasonal pattern, but that's the same case, where I'm not entirely sure how significant that seven day period really is. 
+
+Since all models automatically were given a seasonal component of some sort except for the (1,1,3), I think I want to try fitting fourier terms to both the nonseasonal (1,1,3) and the seasonal auto selected model and compare the accuracy of those. The purpose of the fourier terms here is to capture a year-long seasonal period, so I'm interested to see if the incorporation of a weekly seasonal period would better fit the data, or if it would just over-fit the model. 
+
+
+```{r}
+fourier_tests <- srqstation |>
+  model(fourier1NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 1)),
+        fourier1S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 1), order_constraint = TRUE), 
+        fourier5NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 5)),
+        fourier5S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 5), order_constraint = TRUE), 
+        fourier8NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 8)),
+        fourier8S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 8), order_constraint = TRUE), 
+        )
+  glance(fourier_tests) |>
+  arrange(AICc) |>
+  select(.model, AICc)
+  
+  # K = 5 worked best for both NS and S, followed by K = 8 for both. For all three, NS performed better than S
+fourier_tests <- srqstation |>
+  model(fourier7NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 7)),
+        fourier7S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 7), order_constraint = TRUE), 
+        fourier5NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 5)),
+        fourier5S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 5), order_constraint = TRUE), 
+        fourier6NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 6)),
+        fourier6S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 6), order_constraint = TRUE), 
+        fourier4NS = ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4)),
+        fourier4S = ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 4), order_constraint = TRUE), 
+        )
+  glance(fourier_tests) |>
+  arrange(AICc) |>
+  select(.model, AICc)
+```
+
+K = 4 seems like the best fit for both the seasonal and nonseasonal ARIMA models. I'm continuing with one of each because I want to see if the residuals for each model are different, because in prior fitted models, I was having an issue with really large, almost bell shaped correlation in the residuals. 
+
+```{r, fig.show='hold', out.width='50%'}
+srqstation |>
+  model(ARIMA(AWND ~ 0 + pdq(1, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4))) |>
+  gg_tsresiduals() +
+  ggtitle("Residuals - Nonseasonal ARIMA")
+
+srqstation |>
+  model(ARIMA(AWND ~ 0 + pdq(2, 1, 3) + PDQ(1,0,0) + fourier("year", K = 4), order_constraint = TRUE)) |>
+  gg_tsresiduals() +
+  ggtitle("Residuals - Seasonal ARIMA")
+```
+
+The residuals for both models are very similar -- both have normal distribution, are centered around zero, and don't have concerning variance. Both models have the same spike in correlation at lag 11, which is kind of a weird lag to have that spike at. It indicates that there's some sort of connection between average windspeed on one day and the day a week and a half prior, which isn't the sort of pattern I'd expect with this data (Not that a week-long pattern makes much sense either for a natural phenomenon, but just that 11 days isn't even really a period that we use for anything). I think we can try to fix that by trying a nonseasonal AR(11), so let's first check the residuals on that: 
+
+```{r, fig.show='hold', out.width='50%'}
+srqstation |>
+  model(ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4), order_constraint = TRUE)) |>
+  gg_tsresiduals() +
+  ggtitle("Residuals - Nonseasonal ARIMA")
+
+srqstation |>
+  model(ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 4), order_constraint = TRUE)) |>
+  gg_tsresiduals() +
+  ggtitle("Residuals - Seasonal ARIMA")
+```
+
+These actually look like white noise, so I think we should keep the AR(11) term, and I'm also going to repeat the steps to finding the lowest-AICc fourier term, just in case it's different now that we've changed another aspect of the model. I'm not expecting it to be different, as the nonseasonal AR(11) shouldn't have much of an effect on a yearly seasonal period. 
+
+```{r}
+fourier_tests <- srqstation |>
+  model(fourier1NS = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 1), order_constraint = TRUE),
+        fourier1S = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 1), order_constraint = TRUE), 
+        fourier5NS = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 5), order_constraint = TRUE),
+        fourier5S = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 5), order_constraint = TRUE), 
+        fourier8NS = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 8), order_constraint = TRUE),
+        fourier8S = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 8), order_constraint = TRUE)
+        )
+  glance(fourier_tests) |>
+  arrange(AICc) |>
+  select(.model, AICc)
+  
+  # top two were K = 5, with 42192.9 for NS, and 42194.95 for S. Try again: 
+  fourier_tests <- srqstation |>
+  model(fourier6NS = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 6), order_constraint = TRUE),
+        fourier6S = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 6), order_constraint = TRUE), 
+        fourier4NS = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4), order_constraint = TRUE),
+        fourier4S = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(1,0,0) + fourier("year", K = 4), order_constraint = TRUE))
+  glance(fourier_tests) |>
+  arrange(AICc) |>
+  select(.model, AICc)
+```
+
+Again K = 4 has the lowest AICc for both models, so our chosen model for this data is going to be a nonseasonal ARIMA(11,1,3) with four pairs of fourier terms. We're narrowing down to one because the AICc is lower for the nonseasonal ARIMA, and that model is less complex anyways. 
+
+And now the fitted model over the training set: 
+
+```{r, fig.show='hold', out.width="50%"}
+fit <- srqstation |>
+  model(ARIMANS_fourier4 = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4), order_constraint = TRUE))
+
+srqstation |>
+  autoplot(AWND) +
+  geom_line(data = augment(fit), aes(y = .fitted), col = "red") +
+  theme_bw()
+
+srqstation |>
+  filter(DATE > as.Date("2024-03-31")) |>
+  autoplot(AWND) +
+  geom_line(data = augment(fit) |>
+  filter(DATE > as.Date("2024-03-31")), aes(y = .fitted), col = "red") +
+  theme_bw() +
+  ggtitle("Avg. Windspeed April 2024 - 2025")
+```
+
+The model looks like it's getting the timing of spikes in the data pretty well, but when you look closer you can see that it's not quite as extreme as they actually are. For the regular variation in the day-to-day, I think it's capturing the level pretty accurately, but is a little off when it comes to nailing specific spikes, which is okay because that also means that the model isn't too over-fitted to the training set. 
+
+## Forecasting & Inference
+
+For forecast horizon, I'd usually go for ~20% of the data we already have (we have about 25 years, so we'd forecast another 5 years) because that's the length of time we'd withhold if we were doing a test set/training set. We will do the full five years at the end, but since time has passed since the initial downloading of this data, we are able to check an actual accuracy for a six-week forecast, so I want to do that first. For all forecasts, we're going to do standard parametric forecasts, because the residuals were normally distributed.
+
+```{r}
+# only AWND for April 1-May 13 2025
+srqtest <- read.csv("project_data/srqtest.csv") 
+
+srqtest <- srqtest |> 
+  mutate(DATE = mdy(DATE)) |>
+  as_tsibble(index = DATE)
+
+srqstation_updated <- bind_rows(srqstation, srqtest)
+
+fit <- srqstation |>
+  model(ARIMANS_fourier4 = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4), order_constraint = TRUE))
+
+fit_bench <- srqstation |>
+  model(Naive = NAIVE(AWND), 
+    NS_fourier4 = ARIMA(AWND ~ 0 + pdq(11, 1, 3) + PDQ(0,0,0) + fourier("year", K = 4), order_constraint = TRUE)
+        ) # benchmark method for comparison
+
+fit_bench |>
+  forecast(h = 43) |> # 6 weeks + 1 day
+  autoplot(srqstation_updated |>
+             filter(year(DATE) == 2025)) +
+  theme_bw() +
+  theme(legend.position = "bottom") 
+```
+
+
+Prediction intervals for naive make things a bit hard to see, so let's look without: 
+
+```{r, fig.show='hold', out.width="50%"}
+# so we can see a bit better: 
+fit_bench |>
+  forecast(h = 43) |> # 6 weeks + 1 day
+  autoplot(srqstation_updated |>
+             filter(year(DATE) == 2025), level = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+fit |>
+  forecast(h = 43) |> 
+  autoplot(srqstation_updated |>
+             filter(year(DATE) == 2025)) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+For the full five-year forecast I'm again going to do one with both models (this time with NO intervals), and then one with just the fitted model WITH intervals, just to make everything easier to see. 
+
+```{r, fig.show='hold', out.width="50%"}
+# so we can see a bit better: 
+fit_bench |>
+  forecast(h = "5y") |> 
+  autoplot(srqstation_updated |>
+             filter(DATE >= as.Date("2020-03-31")), level = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom") + 
+  ylim(2, 35) 
+
+fit |>
+  forecast(h = "5y") |> 
+  autoplot(srqstation_updated |>
+             filter(DATE >= as.Date("2020-03-31"))) +
+  theme_bw() +
+  theme(legend.position = "bottom") + 
+  ylim(2, 35)
+```
+
+The prediction intervals for a multi-step model, especially one as far out as this, we might expect to be getting wider. However, because we have 25 years worth of data that is in a roughly repeating pattern, the model reflects this, and the only variation we're seeing much of is seasonal and repeating. The level of the data is also roughly the same over the whole training set, so there's no reason for the model to try to predict jumps up or down (outside of season), which would also create wider intervals.  
+
+Note that we are using naive as our benchmark method, not seasonal naive even though we know there is seasonality within the data. This is because it defaults to a weekly seasonal period, which is what happened when we fitted the ARIMA model with a seasonal component. Since this is not the actual period that we know exists within the data, I didn't think that that was a comparable benchmark forecast. 
+
+## Results & Conclusion
+
+The final model just visually seems like it fits, and of the other models we compared it to, this nonseasonal ARIMA with fourier terms had the lowest AICc, so we know from that it was the most accurate. I was worried that adding in the AR(11) would fix the residuals but wreck the AICc, but the AR(11) models had pretty similar accuracy to the AR(1) or AR(2) models that we had looked at before. Between the white noise residuals and the way the forecast looks, I think the AR(11) is a pretty reliable fit for capturing the majority of the daily windspeeds, but it also is limited in that way-- it doesn't have anything built into it right now that is predicting when we may see short-term spikes in windspeed (ie, for a hurricane). It does have prediction intervals that widen abruptly around the times of year where we have had most of the hurricanes, and shrink in over the early summer, where we see fewer storms. The shape of the prediction intervals on this model is also a really cool visual of the seasonal pattern-- in those early summer months, the 95% interval is indistinguishable from the 80% interval, meaning we're not expecting much of anything outside of that narrow interval. The 95% abruptly shifts into being visible for late summer-spring, which captures the variability of the winter and spring, but also can capture the sudden spikes we'd see during "hurricane season". 
+
+The forecast itself is flat compared to the actual windspeeds, with a lot of the variation getting factored into the prediction interval. This makes sense with what we know about our data-- daily windspeed has a ton of variation that can be based on all sorts of random environmental factors, but knowing what time of year we're looking at can help narrow the variation a bit. The forecast line acts like a level, and the strong seasonal cutoffs within the period help account for the high amount of variability.
+
+While we got a seasonal model out of this project, the original goal was to see if windspeeds were good for forecasting a hurricane season, and to maybe see if we could predict future hurricanes. I think those harsh 95% interval lines can be a part of defining the beginning of the hurricane season, but since the months following already have highly variable wind speeds, we don't get a solid end to the season. For predicting a specific day/week in which a hurricane can be expected, I think we'd need to find an explanatory variable that could act as an indicator that we can "switch on" hurricane-force windspeeds into the forecast. This could be done through dynamic regression, but also if we are able to find something like barometric pressure in the surrounding area a few days ahead of time, that could act as some sort of dummy variable to be the "switch" (ie, if 1-3 days before $y_t$ have significantly low barometric pressure AND it's a certain time of year, train the forecast to spike up for windspeeds for a few days). 
+
